@@ -94,13 +94,49 @@ __device__ uchar d_local_binary_pattern(uchar* image){
  	return pattern;
 
 }
-__global__ void image_to_hisogram_simple(uchar *image1, OUT int *hist1) {
+__global__ void image_to_histogram_simple(uchar *image1, OUT int *hist1) {
 	uchar pattern=d_local_binary_pattern(image1);
 	//we are adding to global memory, which is shared between all the threads in the 
 	//system, which may have same pattern so we need AtomicAdd.	
 	atomicAdd(&hist1[pattern],1);
 
 }
+
+//load img1 to AHARED MEM . compute the binary patters
+//compute the histogram in shared memory
+//load it back to gloabl (hist1)
+__global__ void image_to_histogram_shared(uchar *image, OUT int *hist1){
+	__shared__ uchar shared_image[IMG_DIMENSION];
+	__shared__ int shared_hist[256];
+	int i= threadIdx.x;
+    int j= threadIdx.y;	
+	//load img to shared memory
+	int k=i*IMG_DIMENSION+j;
+	shared_image[k]= image[k]; 
+	if(k>256){
+		shared_hist[k]=0;
+	}
+	__syncthreads(); // all threads load "the image"
+	uchar center= image[k ];
+    uchar pattern =0;
+    if (is_in_image_bounds_d(i - 1, j - 1)) pattern |= (shared_image[(i - 1) * IMG_DIMENSION + (j - 1)] >= center) << 7;
+    if (is_in_image_bounds_d(i - 1, j    )) pattern |= (shared_image[(i - 1) * IMG_DIMENSION + (j    )] >= center) << 6;
+    if (is_in_image_bounds_d(i - 1, j + 1)) pattern |= (shared_image[(i - 1) * IMG_DIMENSION + (j + 1)] >= center) << 5;
+    if (is_in_image_bounds_d(i    , j + 1)) pattern |= (shared_image[(i    ) * IMG_DIMENSION + (j + 1)] >= center) << 4;
+    if (is_in_image_bounds_d(i + 1, j + 1)) pattern |= (shared_image[(i + 1) * IMG_DIMENSION + (j + 1)] >= center) << 3;
+    if (is_in_image_bounds_d(i + 1, j    )) pattern |= (shared_image[(i + 1) * IMG_DIMENSION + (j    )] >= center) << 2;
+    if (is_in_image_bounds_d(i + 1, j - 1)) pattern |= (shared_image[(i + 1) * IMG_DIMENSION + (j - 1)] >= center) << 1;
+    if (is_in_image_bounds_d(i    , j - 1)) pattern |= (shared_image[(i    ) * IMG_DIMENSION + (j - 1)] >= center) << 0;
+	//may to ooptimize the atomicAdd. 
+	atomicAdd((&shared_hist[pattern]),1);
+	//we need to wait for all the threads to update the "pattern"
+	__syncthreads();
+	//load from shared mem to global
+	if(k<256){
+		hist1[k]=shared_hist[k];
+	}
+}
+
 __global__ void histogram_distance_simple(int *h1, int *h2, OUT double *distance) {
 	int i=threadIdx.x;
 	distance[i]=0;
@@ -172,8 +208,8 @@ int main() {
 			CUDA_CHECK(cudaMemset(gpu_hist2,0,sizeof(int)*256));
 			CUDA_CHECK(cudaMemset(gpu_hist_distance,0,sizeof(double)*256));
 //call kernels threadsIntb=1024
-			image_to_hisogram_simple<<<1, threadsIntb>>>(gpu_image1, gpu_hist1);
-            image_to_hisogram_simple<<<1, threadsIntb>>>(gpu_image2, gpu_hist2);
+			image_to_histogram_simple<<<1, threadsIntb>>>(gpu_image1, gpu_hist1);
+            image_to_histogram_simple<<<1, threadsIntb>>>(gpu_image2, gpu_hist2);
             histogram_distance_simple<<<1, 256>>>(gpu_hist1, gpu_hist2, gpu_hist_distance);
 //cudaMemcpy to copy from gpu to host            
 			CUDA_CHECK(cudaMemcpy(&cpu_hist_distance,gpu_hist_distance,sizeof(double),cudaMemcpyDeviceToHost));
@@ -182,6 +218,13 @@ int main() {
 
         CUDA_CHECK(cudaDeviceSynchronize());
         t_finish = get_time_msec();
+//free the global memory
+		CUDA_CHECK(cudaFree(gpu_image1));
+		CUDA_CHECK(cudaFree(gpu_image2));
+		CUDA_CHECK(cudaFree(gpu_hist_distance));
+		CUDA_CHECK(cudaFree(gpu_hist1));
+		CUDA_CHECK(cudaFree(gpu_hist2));
+
         printf("average distance between images %f\n", total_distance / N_IMG_PAIRS);
         printf("total time %f [msec]\n", t_finish - t_start);
     } while (0);
@@ -190,15 +233,41 @@ int main() {
 	/*----------------------------------------------------------------------------*/
     total_distance=0;
 	printf("\n=== GPU Task Serial with shared memory ===\n");
-	t_start = get_time_msec();
-	for (int i = 0; i < N_IMG_PAIRS; i++) {
+	do { /* do {} while (0): to keep variables inside this block in their own scope. remove if you prefer otherwise */
+        /* Your Code Here */
+        uchar *gpu_image1, *gpu_image2;
+        int *gpu_hist1, *gpu_hist2;
+        double *gpu_hist_distance;
+        double cpu_hist_distance;
 
-
-
-	}
-	t_finish = get_time_msec();
-    printf("average distance between images %f\n", total_distance / N_IMG_PAIRS);
-    printf("total time %f [msec]\n", t_finish - t_start);
+//cudaMalloc to allocate  in global memory, all the threads see it.
+        CUDA_CHECK(cudaMalloc((void**)&gpu_image1,sizeof(uchar) * IMG_DIMENSION * IMG_DIMENSION));
+        CUDA_CHECK(cudaMalloc((void**)&gpu_image2,sizeof(uchar) * IMG_DIMENSION * IMG_DIMENSION));
+        CUDA_CHECK(cudaMalloc((void**)&gpu_hist1,sizeof(int)*256));
+        CUDA_CHECK(cudaMalloc((void**)&gpu_hist2,sizeof(int)*256));
+        CUDA_CHECK(cudaMalloc((void**)&gpu_hist_distance,sizeof(double)*256));
+//threads in one threadblock, we use dim3 to use x and y block id
+        dim3 threadsIntb(IMG_DIMENSION,IMG_DIMENSION);
+	
+		t_start = get_time_msec();
+		for (int i = 0; i < N_IMG_PAIRS; i++) {
+			CUDA_CHECK(cudaMemcpy(gpu_image1,&(images1[i*IMG_DIMENSION*IMG_DIMENSION]),IMG_DIMENSION*IMG_DIMENSION,cudaMemcpyHostToDevice));
+    		CUDA_CHECK(cudaMemcpy(gpu_image2,&(images2[i*IMG_DIMENSION*IMG_DIMENSION]),IMG_DIMENSION*IMG_DIMENSION,cudaMemcpyHostToDevice));
+			CUDA_CHECK(cudaMemset(gpu_hist1,0,sizeof(int)*256));
+			CUDA_CHECK(cudaMemset(gpu_hist2,0,sizeof(int)*256));
+    		CUDA_CHECK(cudaMemset(gpu_hist_distance,0,sizeof(double)*256));
+			//shared memory in kernel image_to_histogram_shared
+			image_to_histogram_shared<<<1, threadsIntb>>>(gpu_image1, gpu_hist1);
+    		image_to_histogram_shared<<<1, threadsIntb>>>(gpu_image2, gpu_hist2);
+    		histogram_distance_simple<<<1, 256>>>(gpu_hist1, gpu_hist2, gpu_hist_distance);
+     		CUDA_CHECK(cudaMemcpy(&cpu_hist_distance,gpu_hist_distance,sizeof(double),cudaMemcpyDeviceToHost));
+			total_distance += cpu_hist_distance;
+    	}
+    	CUDA_CHECK(cudaDeviceSynchronize());
+		t_finish = get_time_msec();
+    	printf("average distance between images %f\n", total_distance / N_IMG_PAIRS);
+    	printf("total time %f [msec]\n", t_finish - t_start);
+	}while(0);
 	/*----------------------------------------------------------------------------*/
     /* using GPU + batching */
 	/*----------------------------------------------------------------------------*/
