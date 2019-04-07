@@ -6,4 +6,8 @@
 2.
 2.3 more one thread may have the same pattern, so they write to same memory. 
 	we need to make sure atomic operation , so only one thread can write.
+2.10 run time 923.218994 [ms]
+	 thoughput[pairs/ms] = 10000/923.218944 = 10.727
 
+
+3.
