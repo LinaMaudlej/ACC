@@ -6,8 +6,20 @@
 2.
 2.3 more one thread may have the same pattern, so they write to same memory. 
 	we need to make sure atomic operation , so only one thread can write.
-2.10 run time 923.218994 [ms]
-	 thoughput[pairs/ms] = 10000/923.218944 = 10.727
+2.10 run time 925.177979 [ms]
+	 thoughput[pairs/ms] = 10000/925.177979 = 10.808
 
 
 3.
+3.3 loading image to shared memory means that each thread block has its own memory to read (its image). 
+	in addition, reading from shared memory is faster than global memory
+3.4 computing hisograms in shared memory prevents races between the other threads in the system (by preventing otherthreads in other threadblocks to access it).
+3.5 run time 944.458984
+	speedup [runtime2.10/runtime3.5]= 925.177979 / 944.458984= 0.97  |  <1 sowe have slowdown
+
+
+4. 
+4.5 run time 123.799
+	speedup [runtime3.5/runtime4.5]= 7.4732  |  >1 we have speedup 
+
+

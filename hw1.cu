@@ -106,18 +106,18 @@ __global__ void image_to_histogram_simple(uchar *image1, OUT int *hist1) {
 //compute the histogram in shared memory
 //load it back to gloabl (hist1)
 __global__ void image_to_histogram_shared(uchar *image, OUT int *hist1){
-	__shared__ uchar shared_image[IMG_DIMENSION];
+	__shared__ uchar shared_image[IMG_DIMENSION*IMG_DIMENSION];
 	__shared__ int shared_hist[256];
 	int i= threadIdx.x;
     int j= threadIdx.y;	
 	//load img to shared memory
 	int k=i*IMG_DIMENSION+j;
 	shared_image[k]= image[k]; 
-	if(k>256){
+	if(k<256){
 		shared_hist[k]=0;
 	}
 	__syncthreads(); // all threads load "the image"
-	uchar center= image[k ];
+	uchar center= shared_image[k];
     uchar pattern =0;
     if (is_in_image_bounds_d(i - 1, j - 1)) pattern |= (shared_image[(i - 1) * IMG_DIMENSION + (j - 1)] >= center) << 7;
     if (is_in_image_bounds_d(i - 1, j    )) pattern |= (shared_image[(i - 1) * IMG_DIMENSION + (j    )] >= center) << 6;
@@ -137,6 +137,43 @@ __global__ void image_to_histogram_shared(uchar *image, OUT int *hist1){
 	}
 }
 
+
+//10000 threadblocks
+//32*32 threads
+__global__ void image_to_histogram_batching(uchar* images,OUT int *hist1){
+    __shared__ uchar shared_image[IMG_DIMENSION*IMG_DIMENSION];
+    __shared__ int shared_hist[256];
+    int i= threadIdx.x;
+    int j= threadIdx.y;
+	int blockId = blockIdx.x;  
+  //load img to shared memory
+    int k=i*IMG_DIMENSION+j;
+    shared_image[k]= images[k+blockId * IMG_DIMENSION * IMG_DIMENSION ];
+    if(k<256){
+        shared_hist[k]=0;
+    }
+    __syncthreads(); // all threads load "the image"
+    uchar center= shared_image[k];
+    uchar pattern =0;
+    if (is_in_image_bounds_d(i - 1, j - 1)) pattern |= (shared_image[(i - 1) * IMG_DIMENSION + (j - 1)] >= center) << 7;
+    if (is_in_image_bounds_d(i - 1, j    )) pattern |= (shared_image[(i - 1) * IMG_DIMENSION + (j    )] >= center) << 6;
+    if (is_in_image_bounds_d(i - 1, j + 1)) pattern |= (shared_image[(i - 1) * IMG_DIMENSION + (j + 1)] >= center) << 5;
+    if (is_in_image_bounds_d(i    , j + 1)) pattern |= (shared_image[(i    ) * IMG_DIMENSION + (j + 1)] >= center) << 4;
+    if (is_in_image_bounds_d(i + 1, j + 1)) pattern |= (shared_image[(i + 1) * IMG_DIMENSION + (j + 1)] >= center) << 3;
+    if (is_in_image_bounds_d(i + 1, j    )) pattern |= (shared_image[(i + 1) * IMG_DIMENSION + (j    )] >= center) << 2;
+    if (is_in_image_bounds_d(i + 1, j - 1)) pattern |= (shared_image[(i + 1) * IMG_DIMENSION + (j - 1)] >= center) << 1;
+    if (is_in_image_bounds_d(i    , j - 1)) pattern |= (shared_image[(i    ) * IMG_DIMENSION + (j - 1)] >= center) << 0;
+    //may to ooptimize the atomicAdd.
+    atomicAdd((&shared_hist[pattern]),1);
+    //we need to wait for all the threads to update the "pattern"
+    __syncthreads();
+    //load from shared mem to global
+    if(k<256){
+        hist1[k + blockId * 256 ]=shared_hist[k];
+    }
+
+}
+
 __global__ void histogram_distance_simple(int *h1, int *h2, OUT double *distance) {
 	int i=threadIdx.x;
 	distance[i]=0;
@@ -149,9 +186,52 @@ __global__ void histogram_distance_simple(int *h1, int *h2, OUT double *distance
 		if(i<half_length){
 			distance[i]=distance[i]+distance[i+half_length];
 		}
-	__syncthreads(); //note not inside if, otherwise you will have a deadlock	
-	half_length /= 2;	
+		__syncthreads(); //note not inside if, otherwise you will have a deadlock	
+		half_length /= 2;	
 	}
+
+}
+
+//10000 threadblock 
+//256 threads.
+__global__ void histogram_distance_batching(int* h1,int* h2,OUT double *distance) {
+    __shared__ double shared_distance[256];
+	int i=threadIdx.x;
+	int blockId=blockIdx.x;
+    int k=i+blockId * 256;
+	shared_distance[i]=0;
+    if(h1[k] + h2[k] != 0){
+     shared_distance[i] += ((double)SQR(h1[k] - h2[k])) / (h1[k] + h2[k]);
+    }
+    __syncthreads();
+    int half_length=256/2;
+    while(half_length>0){
+        if(i<half_length){
+            shared_distance[i]=shared_distance[i]+shared_distance[i+half_length];
+        }
+    	__syncthreads(); //note not inside if, otherwise you will have a deadlock
+    	half_length /= 2;
+    }
+	__syncthreads();
+	if(i==0){
+		distance[blockId]=shared_distance[i];
+	}	
+	
+}
+
+//1thb
+//10000 threads.
+__global__ void distances_to_distance_batching(double* distance){
+	int i=threadIdx.x;
+   int half_length=N_IMG_PAIRS/2;
+    while(half_length>0){
+        if(i<half_length){
+            distance[i]=distance[i]+distance[i+half_length];
+        }
+    __syncthreads(); //note not inside if, otherwise you will have a deadlock
+    half_length /= 2;
+    }
+ __syncthreads(); 
 
 }
 
@@ -190,35 +270,35 @@ int main() {
         double *gpu_hist_distance; 
         double cpu_hist_distance;
 
-//cudaMalloc to allocate  in global memory, all the threads see it.
+		//cudaMalloc to allocate  in global memory, all the threads see it.
 		CUDA_CHECK(cudaMalloc((void**)&gpu_image1,sizeof(uchar) * IMG_DIMENSION * IMG_DIMENSION));
 		CUDA_CHECK(cudaMalloc((void**)&gpu_image2,sizeof(uchar) * IMG_DIMENSION * IMG_DIMENSION)); 
 		CUDA_CHECK(cudaMalloc((void**)&gpu_hist1,sizeof(int)*256)); 
     	CUDA_CHECK(cudaMalloc((void**)&gpu_hist2,sizeof(int)*256)); 
 		CUDA_CHECK(cudaMalloc((void**)&gpu_hist_distance,sizeof(double)*256)); 
-//threads in one threadblock, we use dim3 to use x and y block id
+		//threads in one threadblock, we use dim3 to use x and y block id
 		dim3 threadsIntb(IMG_DIMENSION,IMG_DIMENSION);
         t_start = get_time_msec();
         for (int i = 0; i < N_IMG_PAIRS; i++) {
-//cudaMemcpy to copy from host to global memory
+			//cudaMemcpy to copy from host to global memory
 			CUDA_CHECK(cudaMemcpy(gpu_image1,&(images1[i*IMG_DIMENSION*IMG_DIMENSION]),IMG_DIMENSION*IMG_DIMENSION,cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(gpu_image2,&(images2[i*IMG_DIMENSION*IMG_DIMENSION]),IMG_DIMENSION*IMG_DIMENSION,cudaMemcpyHostToDevice));
-//set to zeor0
+			//set to zeor0
 			CUDA_CHECK(cudaMemset(gpu_hist1,0,sizeof(int)*256));
 			CUDA_CHECK(cudaMemset(gpu_hist2,0,sizeof(int)*256));
 			CUDA_CHECK(cudaMemset(gpu_hist_distance,0,sizeof(double)*256));
-//call kernels threadsIntb=1024
+			//call kernels threadsIntb=1024
 			image_to_histogram_simple<<<1, threadsIntb>>>(gpu_image1, gpu_hist1);
             image_to_histogram_simple<<<1, threadsIntb>>>(gpu_image2, gpu_hist2);
             histogram_distance_simple<<<1, 256>>>(gpu_hist1, gpu_hist2, gpu_hist_distance);
-//cudaMemcpy to copy from gpu to host            
+			//cudaMemcpy to copy from gpu to host            
 			CUDA_CHECK(cudaMemcpy(&cpu_hist_distance,gpu_hist_distance,sizeof(double),cudaMemcpyDeviceToHost));
             total_distance += cpu_hist_distance;
         }
 
         CUDA_CHECK(cudaDeviceSynchronize());
         t_finish = get_time_msec();
-//free the global memory
+		//free the global memory
 		CUDA_CHECK(cudaFree(gpu_image1));
 		CUDA_CHECK(cudaFree(gpu_image2));
 		CUDA_CHECK(cudaFree(gpu_hist_distance));
@@ -240,13 +320,13 @@ int main() {
         double *gpu_hist_distance;
         double cpu_hist_distance;
 
-//cudaMalloc to allocate  in global memory, all the threads see it.
+		//cudaMalloc to allocate  in global memory, all the threads see it.
         CUDA_CHECK(cudaMalloc((void**)&gpu_image1,sizeof(uchar) * IMG_DIMENSION * IMG_DIMENSION));
         CUDA_CHECK(cudaMalloc((void**)&gpu_image2,sizeof(uchar) * IMG_DIMENSION * IMG_DIMENSION));
         CUDA_CHECK(cudaMalloc((void**)&gpu_hist1,sizeof(int)*256));
         CUDA_CHECK(cudaMalloc((void**)&gpu_hist2,sizeof(int)*256));
         CUDA_CHECK(cudaMalloc((void**)&gpu_hist_distance,sizeof(double)*256));
-//threads in one threadblock, we use dim3 to use x and y block id
+		//threads in one threadblock, we use dim3 to use x and y block id
         dim3 threadsIntb(IMG_DIMENSION,IMG_DIMENSION);
 	
 		t_start = get_time_msec();
@@ -265,7 +345,12 @@ int main() {
     	}
     	CUDA_CHECK(cudaDeviceSynchronize());
 		t_finish = get_time_msec();
-    	printf("average distance between images %f\n", total_distance / N_IMG_PAIRS);
+        CUDA_CHECK(cudaFree(gpu_image1));
+        CUDA_CHECK(cudaFree(gpu_image2));
+        CUDA_CHECK(cudaFree(gpu_hist_distance));
+        CUDA_CHECK(cudaFree(gpu_hist1));
+        CUDA_CHECK(cudaFree(gpu_hist2));
+	   	printf("average distance between images %f\n", total_distance / N_IMG_PAIRS);
     	printf("total time %f [msec]\n", t_finish - t_start);
 	}while(0);
 	/*----------------------------------------------------------------------------*/
@@ -273,9 +358,57 @@ int main() {
 	/*----------------------------------------------------------------------------*/
 	total_distance=0;
 	printf("\n=== GPU Batching ===\n");
-    /* Your Code Here */
-    printf("average distance between images %f\n", total_distance / N_IMG_PAIRS);
-    printf("total time %f [msec]\n", t_finish - t_start);
+    do { /* do {} while (0): to keep variables inside this block in their own scope. remove if you prefer otherwise */
+        /* Your Code Here */
+        uchar *gpu_images1, *gpu_images2;
+        int *gpu_hist1, *gpu_hist2;
+        double *gpu_hist_distance;
+        double cpu_hist_distance;
+
+		//cudaMalloc to allocate  in global memory, all the threads see it.
+		//we allocate all the N_IMG_PAIRS in the global memory
+        CUDA_CHECK(cudaMalloc((void**)&gpu_images1,sizeof(uchar) * N_IMG_PAIRS * IMG_DIMENSION * IMG_DIMENSION));
+        CUDA_CHECK(cudaMalloc((void**)&gpu_images2,sizeof(uchar) * N_IMG_PAIRS * IMG_DIMENSION * IMG_DIMENSION));
+        //copying from host all the N_IMG_PAIRS images
+	    CUDA_CHECK(cudaMemcpy(gpu_images1,images1,N_IMG_PAIRS * IMG_DIMENSION * IMG_DIMENSION,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpu_images2,images2,N_IMG_PAIRS * IMG_DIMENSION * IMG_DIMENSION,cudaMemcpyHostToDevice));
+		//hisogram memory		
+        CUDA_CHECK(cudaMalloc((void**)&gpu_hist1,sizeof(int)*256 * N_IMG_PAIRS ));
+        CUDA_CHECK(cudaMalloc((void**)&gpu_hist2,sizeof(int)*256 * N_IMG_PAIRS ));
+        CUDA_CHECK(cudaMemset(gpu_hist1,0,sizeof(int)*256 * N_IMG_PAIRS));
+        CUDA_CHECK(cudaMemset(gpu_hist2,0,sizeof(int)*256 * N_IMG_PAIRS));
+
+        CUDA_CHECK(cudaMalloc((void**)&gpu_hist_distance,sizeof(double)*N_IMG_PAIRS));
+        CUDA_CHECK(cudaMemset(gpu_hist_distance,0,sizeof(double)*N_IMG_PAIRS));
+
+
+		dim3 threadsIntb(IMG_DIMENSION,IMG_DIMENSION);
+		t_start = get_time_msec();
+		//threadblock = N_IMG_PAIRS , thread in the tb= 32*32
+		image_to_histogram_batching<<<N_IMG_PAIRS,threadsIntb>>>(gpu_images1,gpu_hist1);
+		image_to_histogram_batching<<<N_IMG_PAIRS,threadsIntb>>>(gpu_images2,gpu_hist2);
+		histogram_distance_batching<<<N_IMG_PAIRS, 256>>>(gpu_hist1, gpu_hist2, gpu_hist_distance);
+
+		//optimize it -> run in kernel		
+		for(int i=0;i<N_IMG_PAIRS;i++){
+		CUDA_CHECK(cudaMemcpy(&cpu_hist_distance,&(gpu_hist_distance[i]),sizeof(double),cudaMemcpyDeviceToHost));
+        total_distance += cpu_hist_distance;
+		}
+//		distances_to_distance_batching<<<1,N_IMG_PAIRS>>>(gpu_hist_distance);
+// 		CUDA_CHECK(cudaMemcpy(&cpu_hist_distance,gpu_hist_distance,sizeof(double),cudaMemcpyDeviceToHost));
+//		total_distance += cpu_hist_distance;
+
+		CUDA_CHECK(cudaDeviceSynchronize());
+		t_finish = get_time_msec();
+        CUDA_CHECK(cudaFree(gpu_images1));
+        CUDA_CHECK(cudaFree(gpu_images2));
+        CUDA_CHECK(cudaFree(gpu_hist_distance));
+        CUDA_CHECK(cudaFree(gpu_hist1));
+        CUDA_CHECK(cudaFree(gpu_hist2));
+	
+		printf("average distance between images %f\n", total_distance / N_IMG_PAIRS);
+    	printf("total time %f [msec]\n", t_finish - t_start);
+	}while(0);
 
     return 0;
 }
